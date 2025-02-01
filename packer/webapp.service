@@ -1,0 +1,33 @@
+[Unit]
+Description=Spring Boot Web Application
+ConditionPathExists=/opt/webapp/.env
+After=syslog.target
+After=network.target
+
+[Service]
+User=csye6225
+Group=csye6225
+EnvironmentFile=/opt/webapp/.env
+
+# Start the Spring Boot application with the WAR file and pass DB credentials and server port
+ExecStart=/usr/bin/java -jar /opt/webapp/webapp.war \
+  --spring.datasource.url=${DB_URL} \
+  --spring.datasource.username=${DB_USERNAME} \
+  --spring.datasource.password=${DB_PASSWORD} \
+  --server.port=${SERVER_PORT} \
+  --spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver \
+  --spring.jpa.hibernate.ddl-auto=update \
+  --spring.datasource.hikari.connection-timeout=1000 \
+  --aws.region=${AWS_REGION} \
+  --aws.s3.bucket=${AWS_S3_BUCKET}
+
+# Redirect logs to the systemd journal for easier debugging
+StandardOutput=journal
+StandardError=journal
+
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
