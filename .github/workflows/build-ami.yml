@@ -1,0 +1,246 @@
+name: Integration Test and Build Packer AMI
+
+on:
+  pull_request:
+    types:
+      - closed
+
+jobs:
+  run-tests:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4.4.0
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: Install MySQL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mysql-server
+          sudo service mysql start
+
+      - name: Wait for MySQL to be ready
+        run: |
+          echo "Waiting for MySQL to start..."
+          for i in {1..30}; do
+            if mysqladmin ping --silent; then
+              echo "MySQL is up and running!"
+              break
+            fi
+            echo "Waiting for MySQL..."
+            sleep 2
+          done
+
+      - name: Run Unit Tests
+        run: |
+          mvn test -Dspring.datasource.url=${{ secrets.DB_URL }} \
+                   -Dspring.datasource.username=${{ secrets.DB_USERNAME }} \
+                   -Dspring.datasource.password=${{ secrets.DB_PASSWORD }} \
+                   -Dspring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver \
+                   -Dspring.jpa.hibernate.ddl-auto=update \
+                   -Dspring.datasource.hikari.connection-timeout=1000 \
+                   -Dserver.port=8080 \
+                   -Daws.region=${{ secrets.AWS_REGION }} \
+                   -Daws.s3.bucket=${{ secrets.AWS_S3_BUCKET }} \
+                   -Dsns.topic.arn=${{ secrets.TOPIC_ARN }}
+
+  build-artifact:
+    needs: run-tests
+    if: success() # Proceed only if integration tests pass
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4.4.0
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: Build Application Artifact (Spring Boot WAR)
+        run: |
+          mvn clean package -DskipTests
+          cp target/webapp-0.0.1-SNAPSHOT.war ./webapp.war
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-artifact
+          path: ./webapp.war
+
+  build-ami:
+    needs: build-artifact
+    if: success() # Proceed only if artifact build succeeds
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_DEV }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_DEV }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Download Application Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-artifact
+
+      - name: Set up Packer
+        uses: hashicorp/setup-packer@v3.1.0
+
+      - name: Generate AMI Name with Timestamp
+        id: ami_name
+        run: echo "AMI_NAME=webapp-ami-$(date +%Y%m%d%H%M%S)" >> $GITHUB_ENV
+
+      - name: Initialize Packer
+        run: packer init packer/webapp.pkr.hcl
+
+      - name: Build Packer AMI
+        id: build_ami
+        run: |
+          packer build -var "app_war=./webapp.war" \
+                       -var "DB_USERNAME=${{ secrets.DB_USERNAME }}" \
+                       -var "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" \
+                       -var "DB_URL=${{ secrets.DB_URL }}" \
+                       -var "SERVER_PORT=${{ secrets.SERVER_PORT }}" \
+                       -var "aws_region=${{ secrets.AWS_REGION }}" \
+                       -var "vpc_id=${{ secrets.VPC_ID }}" \
+                       -var "subnet_id=${{ secrets.SUBNET_ID }}" \
+                       -var "ami_name=${{ env.AMI_NAME }}" \
+                       -var "aws_demo_accountid=${{ secrets.DEMO_ACCOUNT_ID }}" \
+                       -var "source_ami=${{ secrets.SOURCE_AMI }}" \
+                       -var "ssh_username=${{ secrets.SSH_USERNAME }}" \
+                       packer/webapp.pkr.hcl
+
+      - name: Upload Manifest as Artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-file
+          path: manifest.json
+
+  instance-refresh:
+    needs: build-ami
+    if: success()
+    runs-on: ubuntu-latest
+    env:
+      DEPLOYMENT_MODE: ${{ secrets.DEPLOYMENT_MODE }}
+    steps:
+      - name: Configure AWS keys
+        run: |
+          if [ "$DEPLOYMENT_MODE" == "demo" ]; then
+            echo "Using DEPLOYMENT_MODE=demo"
+            echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID_DEMO }}" >> $GITHUB_ENV
+            echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY_DEMO }}" >> $GITHUB_ENV
+          else
+            echo "Using DEPLOYMENT_MODE=dev"
+            echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID_DEV }}" >> $GITHUB_ENV
+            echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY_DEV }}" >> $GITHUB_ENV
+          fi
+
+      - name: Set up AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Download Manifest Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: manifest-file
+
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Extract Latest AMI ID
+        id: extract_ami
+        run: |
+          if [ -f manifest.json ]; then
+            # Extract the AMI ID from the manifest file
+            latest_ami_id=$(jq -r '.builds[-1].artifact_id | split(":")[1]' manifest.json)
+            echo "latest_ami_id=$latest_ami_id" >> $GITHUB_ENV
+            echo "AMI ID: $latest_ami_id"
+          else
+            echo "Error: manifest.json not found"
+            exit 1
+          fi
+
+      - name: Fetch Launch Template Name
+        id: fetch_lt_name
+        run: |
+          lt_name=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-name "${{ secrets.AUTOSCALING_GROUP_NAME }}" \
+            --query 'AutoScalingGroups[0].LaunchTemplate.LaunchTemplateName' \
+            --output text)
+          echo "Launch Template Name: $lt_name" 
+          echo "lt_name=$lt_name" >> $GITHUB_ENV
+
+      - name: Retrieve Existing Launch Template Configuration
+        run: |
+          aws ec2 describe-launch-template-versions \
+          --launch-template-name "${{ env.lt_name }}" \
+          --query 'sort_by(LaunchTemplateVersions, &VersionNumber)[-1].LaunchTemplateData' \
+          > existing_lt.json
+
+      - name: Modify Launch Template with New AMI
+        run: |
+          jq --arg ami_id "${{ env.latest_ami_id }}" '.ImageId |= $ami_id' existing_lt.json > updated_lt.json
+          aws ec2 create-launch-template-version \
+            --launch-template-name "${{ env.lt_name }}" \
+            --launch-template-data file://updated_lt.json
+
+      - name: Set Latest Launch Template Version as Default
+        run: |
+          latest_version=$(aws ec2 describe-launch-template-versions \
+            --launch-template-name "${{ env.lt_name }}" \
+            --query 'sort_by(LaunchTemplateVersions, &VersionNumber)[-1].VersionNumber' --output text)
+          aws ec2 modify-launch-template \
+            --launch-template-name "${{ env.lt_name }}" \
+            --default-version "$latest_version"
+
+      - name: Start Instance Refresh
+        id: start_instance_refresh
+        run: |
+          instance_refresh_id=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "${{ secrets.AUTOSCALING_GROUP_NAME }}" \
+            --preferences MinHealthyPercentage=100 \
+            --query "InstanceRefreshId" \
+            --output text)
+          echo "Instance Refresh ID: $instance_refresh_id"
+          echo "instance_refresh_id=$instance_refresh_id" >> $GITHUB_ENV
+
+      - name: Wait for Instance Refresh to Complete
+        run: |
+          while true; do
+            status=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "${{ secrets.AUTOSCALING_GROUP_NAME }}" \
+              --query "InstanceRefreshes[?InstanceRefreshId=='${{ env.instance_refresh_id }}'].Status" \
+              --output text)
+            echo "Instance Refresh Status: $status"
+            if [ "$status" == "Successful" ]; then
+              echo "Instance Refresh completed successfully!"
+              break
+            elif [ "$status" == "Failed" ] || [ "$status" == "Cancelled" ]; then
+              echo "Instance Refresh failed or cancelled."
+              exit 1
+            else
+              echo "Instance Refresh in progress. Waiting..."
+              sleep 30
+            fi
+          done
